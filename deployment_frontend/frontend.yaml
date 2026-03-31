@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend-deployment
+  labels:
+    app: frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: tiru111/crud-frontend:latest
+        imagePullPolicy: IfNotPresent  # Useful for local images
+        ports:
+        - containerPort: 5173
+        envFrom:
+        - secretRef:
+            name: frontend-secrets   # Connects to the secret we verified earlier
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-service
+spec:
+  type: NodePort  # Exposing outside cluster, you can change to LoadBalancer if preferred
+  selector:
+    app: frontend
+  ports:
+  - protocol: TCP
+    port: 80           # Access port from outside (or browser)
+    targetPort: 5173   # The port the container is listening on
+    nodePort: 30005    # Static NodePort to access on browser (http://localhost:30005)

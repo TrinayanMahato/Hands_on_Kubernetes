@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-deployment
+  labels:
+    app: backend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+      - name: backend
+        image: tiru111/crud-backend:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3000
+        envFrom:
+        - secretRef:
+            name: backend-secrets   # Connects to the backend-secrets we fixed earlier
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-service
+spec:
+  type: NodePort      # Exposes the backend outside the cluster (e.g., to the frontend browser)
+  selector:
+    app: backend
+  ports:
+  - protocol: TCP
+    port: 3000        # Internal cluster port
+    targetPort: 3000  # The port your container listens on
+    nodePort: 30000   # Static NodePort to access on browser (http://<node-ip>:30000). (Valid range: 30000-32767)
