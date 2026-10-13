@@ -10,12 +10,12 @@ Deployments, Services, NodePort exposure, and injecting configuration through Se
 
 - [What's Here](#whats-here)
 - [Architecture](#architecture)
+- [Operational Notes](#operational-notes)
 - [Prerequisites](#prerequisites)
 - [Deploying](#deploying)
 - [Verifying](#verifying)
 - [Configuration](#configuration)
 - [Teardown](#teardown)
-- [Notes and Gotchas](#notes-and-gotchas)
 
 ---
 
@@ -38,27 +38,82 @@ Each deployment manifest contains both the `Deployment` and its `Service`, separ
 
 ## Architecture
 
+Two independently scalable tiers, each exposed on its own NodePort, with configuration
+injected from Secrets rather than baked into the images.
+
 ```
-  Browser
-     │
-     ├── :30005 ──► frontend-service ──► frontend pods ×2  (container :5173)
-     │                                        │
-     │                                        ▼ VITE_API_BASE_URL
-     └── :30000 ──► backend-service  ──► backend pods ×2   (container :3000)
-                                              │
-                                              ▼ MONGO_URI
-                                          MongoDB
+                         ┌──────────┐
+                         │ Browser  │
+                         └────┬─────┘
+              :30005          │          :30000
+        ┌───────────────────┬─┴─┬───────────────────┐
+        ▼                   │   │                   ▼
+┌───────────────────┐       │   │       ┌───────────────────┐
+│ frontend-service  │       │   │       │  backend-service  │
+│ NodePort 80→5173  │       │   │       │ NodePort 3000     │
+└─────────┬─────────┘       │   │       └─────────┬─────────┘
+          │ selector app=frontend     selector app=backend │
+          ▼                                                ▼
+┌───────────────────┐                   ┌───────────────────┐
+│ frontend-deploy   │                   │ backend-deploy    │
+│ replicas: 2       │                   │ replicas: 2       │
+│ :5173             │                   │ :3000             │
+└─────────┬─────────┘                   └─────────┬─────────┘
+          │ envFrom                               │ envFrom
+          ▼                                       ▼
+┌───────────────────┐                   ┌───────────────────┐
+│ frontend-secrets  │                   │ backend-secrets   │
+│ VITE_API_BASE_URL │                   │ PORT, MONGO_URI   │
+└───────────────────┘                   └─────────┬─────────┘
+                                                  ▼
+                                              MongoDB
 ```
 
-Both tiers are exposed with `NodePort` because the frontend runs **in the browser** — it
-needs a backend address reachable from outside the cluster, not an internal DNS name.
+### Object model
 
-| Component | Image | Replicas | Container port | NodePort |
-|---|---|---|---|---|
-| Frontend | `tiru111/crud-frontend:latest` | 2 | 5173 | **30005** |
-| Backend | `tiru111/crud-backend:latest` | 2 | 3000 | **30000** |
+Each manifest file carries two objects separated by `---`: a **Deployment** that owns pods,
+and a **Service** that gives them a stable address.
 
----
+| Object | Purpose | Binds via |
+| :--- | :--- | :--- |
+| `Deployment` | Declares desired replica count and the pod template | `matchLabels` |
+| `Service` | Stable virtual IP + NodePort in front of matching pods | `selector` |
+| `Secret` | Key/value configuration consumed as environment variables | `envFrom.secretRef` |
+
+The coupling is entirely by label. `backend-service` finds its pods because its `selector`
+is `app: backend` and the pod template carries that label — the Service never references
+the Deployment by name.
+
+### Why both tiers use NodePort
+
+An internal `ClusterIP` would be enough for a server-to-server call, but the frontend here
+runs **in the browser**. When that JavaScript calls the API, the request originates from
+the user's machine, not from inside the cluster, so cluster-internal DNS such as
+`backend-service:3000` cannot resolve. Both tiers therefore need an address reachable from
+outside, which is what `VITE_API_BASE_URL` points at.
+
+### Configuration flow
+
+Secrets use `stringData`, so values are written in plain text and Kubernetes base64-encodes
+them on admission. `envFrom.secretRef` then projects **every** key in the Secret into the
+container as an environment variable, which is why the key names in the Secret match the
+variable names the application reads.
+
+The ordering constraint follows from this: a Deployment referencing a Secret that does not
+exist leaves its pods in `CreateContainerConfigError`, so Secrets are applied first.
+
+## Operational Notes
+
+- **Secrets do not hot-reload.** Values projected through `envFrom` are read once at
+  container start. After editing a Secret, restart the Deployment so pods pick it up:
+  `kubectl rollout restart deployment/backend-deployment`.
+- **`imagePullPolicy: IfNotPresent`** uses a locally built image when one is present, which
+  is convenient locally but means a `:latest` tag is not re-pulled when you push a new one.
+  Delete the pods or move to versioned tags when that matters.
+- **NodePort range** is `30000–32767`; the two static ports here sit at the bottom of it.
+- **`VITE_API_BASE_URL` is read at build time by Vite.** Supplying it at runtime only takes
+  effect if the container builds on start — a pre-built static bundle carries whatever
+  value was present during `npm run build`.
 
 ## Prerequisites
 
@@ -144,17 +199,3 @@ kubectl delete -f secrets/backend.yaml
 ```
 
 ---
-
-## Notes and Gotchas
-
-- **`imagePullPolicy: IfNotPresent`** on both Deployments means a locally built image is
-  used if present. Convenient for local work, but a `:latest` tag will then *not* be
-  re-pulled when you push a new one — delete the pods or use a versioned tag.
-- **NodePort range** is `30000–32767`. The two static ports here sit at the bottom of it.
-- **`VITE_API_BASE_URL` is a build-time variable in Vite.** Supplying it as a runtime env
-  var only works if the frontend container reads it at startup; a pre-built static bundle
-  will have baked in whatever value was present at `npm run build`. Verify this if the
-  frontend cannot reach the API.
-- **The committed Secrets contain a hard-coded host IP.** Replace it with your own before
-  deploying, and prefer a real secret manager — or at minimum an untracked local override —
-  over committing connection strings, since `stringData` is plain text in git.
